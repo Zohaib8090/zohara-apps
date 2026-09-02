@@ -1,0 +1,11 @@
+# Build artifacts
+target/
+**/*.rs.bk
+
+# IDEs
+.vscode/
+.idea/
+
+# OS junk
+.DS_Store
+Thumbs.db

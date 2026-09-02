@@ -1,0 +1,43 @@
+# PKGBUILD for zohara-welcome
+# Built and published to the Zohara Packages repo (zohara-stable/beta/alpha).
+#
+# Note: a single PKGBUILD per package. The other binaries (zohara-update,
+# zohara-usermgr, zohara-migrate) get their own PKGBUILDs in this repo.
+
+pkgname=zohara-welcome
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Zohara OS first-boot welcome window (GTK4 + libadwaita)"
+arch=('x86_64')
+url="https://github.com/Zohaib8090/zohara-apps"
+license=('MIT' 'GPL3')
+depends=(
+  'gtk4'
+  'libadwaita'
+  'glib2'
+)
+makedepends=('rust' 'cargo' 'pkgconf')
+provides=('zohara-welcome')
+conflicts=('zohara-welcome-git')
+
+source=()
+sha256sums=()
+
+pkgver() {
+  if [ -n "${_PKGVER:-}" ]; then
+    echo "$_PKGVER"
+  else
+    grep '^version' Cargo.toml | head -1 | cut -d'"' -f2
+  fi
+}
+
+build() {
+  cargo build --release --bin zohara-welcome
+}
+
+package() {
+  install -Dm755 "target/release/zohara-welcome" \
+    "$pkgdir/usr/bin/zohara-welcome"
+  install -Dm644 "$srcdir/../data/zohara-welcome.desktop" \
+    "$pkgdir/usr/share/applications/zohara-welcome.desktop"
+}

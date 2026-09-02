@@ -1,0 +1,146 @@
+name: Build & Publish Zohara Apps
+
+on:
+  push:
+    branches: [main, beta]
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: 'Release channel'
+        required: true
+        type: choice
+        options: [stable, beta, alpha]
+
+env:
+  CARGO_TERM_COLOR: always
+  PACKAGES_REPO: Zohaib8090/zohara-packages
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:latest
+    permissions:
+      contents: write
+    steps:
+      - name: Install Arch build dependencies
+        run: |
+          pacman -Syu --noconfirm
+          pacman -S --noconfirm --needed \
+            base-devel git rust gtk4 libadwaita dbus pkgconf sudo
+          useradd -m -G wheel builder || true
+          echo 'builder ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/builder
+          mkdir -p /home/builder/.cargo /home/builder/target
+          chown -R builder:builder /home/builder
+
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Check Code
+        run: sudo -u builder env CARGO_TARGET_DIR=/home/builder/target cargo check --release
+
+      - name: Build Release Binaries
+        run: sudo -u builder env CARGO_TARGET_DIR=/home/builder/target cargo build --release
+
+      - name: List built binaries
+        run: ls -lh /home/builder/target/release/zohara-*
+
+      - name: Determine channel
+        id: channel
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            CH="${{ github.event.inputs.channel }}"
+          elif [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            CH="stable"
+          elif [ "${{ github.ref }}" = "refs/heads/beta" ]; then
+            CH="beta"
+          else
+            echo "::error::Unknown ref ${{ github.ref }}"
+            exit 1
+          fi
+          echo "channel=$CH" >> "$GITHUB_OUTPUT"
+
+      - name: Compute version
+        id: version
+        run: |
+          VER=$(grep '^version' Cargo.toml | head -1 | cut -d'"' -f2)
+          if [ -z "$VER" ]; then
+            echo "::error::Could not read version from Cargo.toml"
+            exit 1
+          fi
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+
+      - name: Package each binary with makepkg
+        run: |
+          # Each crate has its own PKGBUILD. We can't easily call makepkg
+          # 4 times in a single workflow, so we install each binary and
+          # its .desktop file directly from the prebuilt cargo target.
+          # (The OTA path uses the same flat layout; makepkg is a
+          # nicety we skip here for simplicity.)
+          mkdir -p /tmp/built
+          cp -v /home/builder/target/release/zohara-* /tmp/built/ || true
+          ls -lh /tmp/built/
+
+      - name: Get or create channel release in zohara-packages
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CHANNEL: ${{ steps.channel.outputs.channel }}
+        run: |
+          pacman -S --noconfirm --needed github-cli
+          if [ "$CHANNEL" = "stable" ]; then
+            TAG="stable"
+          else
+            TAG="channel-$CHANNEL"
+          fi
+          REL_ID=$(gh release view "$TAG" --repo "$PACKAGES_REPO" --json id -q '.id' 2>/dev/null || true)
+          if [ -z "$REL_ID" ]; then
+            PRE=$([ "$CHANNEL" != "stable" ] && echo "--prerelease" || echo "")
+            gh release create "$TAG" \
+              --repo "$PACKAGES_REPO" \
+              --title "Zohara Packages — $CHANNEL" \
+              --notes "Auto-managed Arch package repository for the **$CHANNEL** channel. Updated by the zohara-apps CI." \
+              $PRE
+          fi
+          echo "release_tag=$TAG" >> "$GITHUB_ENV"
+
+      - name: Upload all built binaries to the channel release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ env.release_tag }}
+        run: |
+          for bin in /tmp/built/*; do
+            echo "Uploading $(basename "$bin")..."
+            gh release upload "$TAG" "$bin" \
+              --repo "$PACKAGES_REPO" \
+              --clobber
+          done
+
+      - name: Dispatch to zohara-packages publish workflow
+        env:
+          GH_TOKEN: ${{ secrets.PACKAGES_DISPATCH_TOKEN }}
+          VER: ${{ steps.version.outputs.version }}
+          CHANNEL: ${{ steps.channel.outputs.channel }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::warning::PACKAGES_DISPATCH_TOKEN not set; zohara.db / apps.json not auto-updated."
+            exit 0
+          fi
+          for bin in /tmp/built/*; do
+            name=$(basename "$bin")
+            pkg="${name%-*}"  # strip version suffix
+            ARTIFACT_URL="https://github.com/$PACKAGES_REPO/releases/download/${{ env.release_tag }}/$name"
+            echo "Dispatching $pkg $VER channel=$CHANNEL"
+            curl -X POST \
+              -H "Authorization: token $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$PACKAGES_REPO/dispatches" \
+              -d "{
+                \"event_type\": \"package-published\",
+                \"client_payload\": {
+                  \"package_name\": \"$pkg\",
+                  \"version\": \"$VER\",
+                  \"artifact_url\": \"$ARTIFACT_URL\",
+                  \"channel\": \"$CHANNEL\"
+                }
+              }"
+          done

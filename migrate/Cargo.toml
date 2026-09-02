@@ -1,0 +1,21 @@
+[package]
+name = "zohara-migrate"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Zohara OS migration tool. Imports packages, configs, and user data from another distro."
+
+[[bin]]
+name = "zohara-migrate"
+path = "src/main.rs"
+
+[dependencies]
+gtk = { workspace = true }
+libadwaita = { workspace = true }
+glib = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }
+zohara-common = { workspace = true }

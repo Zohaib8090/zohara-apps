@@ -1,0 +1,21 @@
+[package]
+name = "zohara-usermgr"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Zohara OS user-account manager."
+
+[[bin]]
+name = "zohara-usermgr"
+path = "src/main.rs"
+
+[dependencies]
+gtk = { workspace = true }
+libadwaita = { workspace = true }
+glib = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }
+zohara-common = { workspace = true }

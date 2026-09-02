@@ -1,0 +1,22 @@
+[package]
+name = "zohara-update"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Zohara OS updates center (pacman / kernel / driver / Zohara-OTA panels)."
+
+[[bin]]
+name = "zohara-update"
+path = "src/main.rs"
+
+[dependencies]
+gtk = { workspace = true }
+libadwaita = { workspace = true }
+glib = { workspace = true }
+tokio = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }
+zohara-common = { workspace = true }

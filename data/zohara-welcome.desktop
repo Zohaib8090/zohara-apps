@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Exec=/usr/bin/zohara-welcome
+Name=Zohara Welcome
+Comment=Welcome to Zohara OS
+Icon=distributor-logo
+Terminal=false
+Categories=System;Settings;
