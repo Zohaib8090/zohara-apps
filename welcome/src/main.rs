@@ -272,5 +272,5 @@ fn main() {
     let _args: Vec<&str> = vec![];
     let _ = _args;
 
-    app.run_with_args(&[]);
+    app.run_with_args::<&str>(&[]);
 }

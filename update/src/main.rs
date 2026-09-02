@@ -398,7 +398,7 @@ fn build_panel(cfg: &'static PanelConfig) -> (Box, Rc<Panel>) {
 
             // Track pid so Cancel can kill it.
             let pid = cmd_proc.id();
-            *running_pid.borrow_mut() = pid;
+            *running_pid.borrow_mut() = Some(pid);
 
             // Stream stdout
             let stdout = cmd_proc.stdout.take();
