@@ -328,7 +328,7 @@ fn build_panel(cfg: &'static PanelConfig) -> (Box, Rc<Panel>) {
                 if count > 0 {
                     let label = if count > 1 { "s" } else { "" };
                     p_thread.set_badge(&format!("{count} update{label} available"));
-                    p_thread.updates_view.buffer().unwrap().set_text(&lines);
+                    p_thread.updates_view.buffer().set_text(&lines);
                     p_thread.updates_view.set_visible(true);
                     p_thread.install_btn.set_sensitive(true);
                 } else {
@@ -348,12 +348,12 @@ fn build_panel(cfg: &'static PanelConfig) -> (Box, Rc<Panel>) {
         p.set_badge("Installing…");
         p.set_busy(true);
         p.log_view.set_visible(true);
-        p.log_view.buffer().unwrap().set_text("");
+        p.log_view.buffer().set_text("");
 
         // Spawn the install command. Capture stdout+stderr and stream
         // each line back to the main thread for display in the log view.
         let cmd = p.cfg.install_cmd;
-        let log_buf = p.log_view.buffer().unwrap();
+        let log_buf = p.log_view.buffer();
         let progress = p.progress.clone();
         let install_btn = btn.clone();
         let check_btn = p.check_btn.clone();
@@ -403,8 +403,8 @@ fn build_panel(cfg: &'static PanelConfig) -> (Box, Rc<Panel>) {
             // Stream stdout
             let stdout = cmd_proc.stdout.take();
             let stderr = cmd_proc.stderr.take();
-            let log_buf_out = log_view.buffer().unwrap();
-            let log_buf_err = log_view.buffer().unwrap();
+            let log_buf_out = log_view.buffer();
+            let log_buf_err = log_view.buffer();
             let stdout_thread = thread::spawn(move || {
                 if let Some(out) = stdout {
                     let reader = BufReader::new(out);
@@ -573,10 +573,15 @@ fn main() -> ExitCode {
                 "mesa", "nvidia", "amdgpu", "firmware", "vulkan", "libva", "libdrm", "xf86-video",
             ],
         };
-        for cfg in [&zohara, &system, &kernel, &driver] {
-            let (card, _panel) = build_panel(cfg);
+        let panels: &[&PanelConfig] = &[&zohara, &system, &kernel, &driver];
+        let mut panel_handles: Vec<(Box, Rc<Panel>)> = Vec::new();
+        for cfg in panels {
+            let (card, panel) = build_panel(cfg);
             panel_box.append(&card);
+            panel_handles.push((card, panel));
         }
+        // silence unused
+        let _ = panel_handles;
 
         // Status footer
         let footer = Box::new(Orientation::Horizontal, 8);

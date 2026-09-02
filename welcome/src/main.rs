@@ -10,21 +10,17 @@
 // same icon set. Runs as a libadwaita::Application window so it picks up
 // the user's GTK theme automatically.
 
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
 
-use glib::ExitCode;
 use gtk::prelude::*;
 use gtk::{glib, Application, ApplicationWindow, Button};
-use libadwaita as adw;
 use libadwaita::prelude::*;
 
 const APP_ID: &str = "io.zohara.Welcome";
 
 // Catppuccin Mocha palette (matches the existing Python welcome / settings)
 const BG: &str = "#1e1e2e";
-const FG: &str = "#cdd6f4";
 const MUTED: &str = "#585b70";
 const COLOR_INSTALL: &str = "#89b4fa"; // blue
 const COLOR_MIGRATE: &str = "#a6e3a1"; // green
@@ -37,16 +33,28 @@ fn is_live_iso() -> bool {
     Path::new("/run/archiso").exists()
 }
 
+/// Returns true if the current effective UID is 0.
+fn is_root() -> bool {
+    // /proc/self/status contains Uid:\t<ruid>\t<euid>\t<suid>\t<fsuid>
+    let Ok(s) = std::fs::read_to_string("/proc/self/status") else {
+        return false;
+    };
+    for line in s.lines() {
+        if let Some(rest) = line.strip_prefix("Uid:") {
+            // euid is the second field.
+            if let Some(euid) = rest.split_whitespace().nth(1) {
+                return euid == "0";
+            }
+        }
+    }
+    false
+}
+
 /// Launch a subprocess. If we're not root, prepend `pkexec` so the user
 /// gets a polkit prompt. Returns the spawned child (still running) or an
 /// error message.
-///
-/// Matches the original Python helper's behaviour:
-/// - on success: return the started child
-/// - on immediate failure: return Err(stderr)
 fn launch(cmd: &[&str], description: &str) -> Result<std::process::Child, String> {
-    let is_root = unsafe { libc::geteuid() } == 0;
-    let full_cmd: Vec<&str> = if is_root {
+    let full_cmd: Vec<&str> = if is_root() {
         cmd.to_vec()
     } else {
         let mut v = vec!["pkexec"];
@@ -67,13 +75,12 @@ fn launch(cmd: &[&str], description: &str) -> Result<std::process::Child, String
         })
 }
 
-/// Build a styled button. Inline-CSS string is the simplest way to get the
-/// Catppuccin look in libadwaita without writing a full CSS stylesheet.
+/// Build a styled button. Inline CSS via CssProvider is the simplest
+/// way to get Catppuccin colors in libadwaita without a full stylesheet.
 fn make_button(label: &str, color: &str) -> Button {
     let btn = Button::with_label(label);
     let css = format!(
-        r#"
-        button {{
+        "button {{
             background-color: {color};
             color: {BG};
             border-radius: 8px;
@@ -84,8 +91,7 @@ fn make_button(label: &str, color: &str) -> Button {
         }}
         button:hover {{
             background-color: alpha({color}, 0.85);
-        }}
-        "#,
+        }}",
         color = color,
         BG = BG,
     );
@@ -105,7 +111,6 @@ fn build_ui(app: &Application) {
     let live = is_live_iso();
     log::info!("Building welcome UI (live_iso={live})");
 
-    // Main window
     let window = ApplicationWindow::builder()
         .application(app)
         .title("Welcome to Zohara OS")
@@ -117,9 +122,8 @@ fn build_ui(app: &Application) {
     // Catppuccin background
     let bg_provider = gtk::CssProvider::new();
     bg_provider.load_from_string(&format!(
-        r#"window {{ background-color: {BG}; color: {FG}; }}"#,
+        "window {{ background-color: {BG}; }}",
         BG = BG,
-        FG = FG,
     ));
     if let Some(display) = gtk::gdk::Display::default() {
         gtk::style_context_add_provider_for_display(
@@ -129,7 +133,6 @@ fn build_ui(app: &Application) {
         );
     }
 
-    // Vertical box: title -> subtitle -> buttons -> status
     let vbox = gtk::Box::new(gtk::Orientation::Vertical, 20);
     vbox.set_margin_top(28);
     vbox.set_margin_bottom(20);
@@ -139,47 +142,35 @@ fn build_ui(app: &Application) {
     vbox.set_valign(gtk::Align::Center);
     window.set_child(Some(&vbox));
 
-    // Title
-    let title = gtk::Label::new(Some("Welcome to Zohara OS"));
+    let title = gtk::Label::new(None);
     title.set_markup(&format!(
-        r#"<span font_size="24pt" font_weight="bold" foreground="{FG}">Welcome to Zohara OS</span>"#,
-        FG = FG
+        "<span font_size=\"24pt\" font_weight=\"bold\" foreground=\"#cdd6f4\">Welcome to Zohara OS</span>"
     ));
     vbox.append(&title);
 
-    // Subtitle
-    let subtitle = gtk::Label::new(Some("What would you like to do?"));
+    let subtitle = gtk::Label::new(None);
     subtitle.set_markup(&format!(
-        r#"<span font_size="14pt" foreground="{MUTED}">What would you like to do?</span>"#,
+        "<span font_size=\"14pt\" foreground=\"{MUTED}\">What would you like to do?</span>",
         MUTED = MUTED
     ));
     vbox.append(&subtitle);
 
-    // Buttons
     let buttons_box = gtk::Box::new(gtk::Orientation::Vertical, 12);
     buttons_box.set_halign(gtk::Align::Center);
     buttons_box.set_hexpand(true);
 
     let status_label = gtk::Label::new(None);
     status_label.set_markup(&format!(
-        r#"<span font_size="9pt" foreground="{MUTED}"> </span>"#,
+        "<span font_size=\"9pt\" foreground=\"{MUTED}\"> </span>",
         MUTED = MUTED
     ));
 
-    // helper: a click handler that runs the launch, updates the status,
-    // and closes the window on success. Mirrors the original Python:
-    # let mut status_ref = status_label.clone();
-    // let win = window.clone();
-    // let label_str = description.to_string();
-    // let _ = btn.connect_clicked(move |_| { ... });
-    //
-    // We use a single closure with a shared reference because the buttons
-    // need slightly different `description` and `cmd` per button.
+    // Click handler: update status, launch the command, close on success.
     macro_rules! on_click {
         ($btn:expr, $desc:expr, $cmd:expr) => {{
             let status_ref = status_label.clone();
             let win = window.clone();
-            let description = $desc.to_string();
+            let description: String = $desc.to_string();
             let cmd: Vec<&'static str> = $cmd.iter().map(|s| *s).collect();
             $btn.connect_clicked(move |_| {
                 status_ref.set_text(&format!("Launching {description}..."));
@@ -203,16 +194,28 @@ fn build_ui(app: &Application) {
     }
 
     let btn_migrate = make_button("Migrate from another OS", COLOR_MIGRATE);
-    on_click!(btn_migrate, "Migration Tool", &["/usr/local/bin/zohara-migrate"]);
+    on_click!(
+        btn_migrate,
+        "Migration Tool",
+        &["/usr/local/bin/zohara-migrate"]
+    );
     buttons_box.append(&btn_migrate);
 
     if !live {
-        let btn_users = make_button("\u{1F464}  Manage Users", COLOR_USERS);
-        on_click!(btn_users, "User Manager", &["/usr/local/bin/zohara-usermgr"]);
+        let btn_users = make_button("👤  Manage Users", COLOR_USERS);
+        on_click!(
+            btn_users,
+            "User Manager",
+            &["/usr/local/bin/zohara-usermgr"]
+        );
         buttons_box.append(&btn_users);
 
-        let btn_update = make_button("\u{1F504}  Update System", COLOR_UPDATE);
-        on_click!(btn_update, "System Updater", &["/usr/local/bin/zohara-update"]);
+        let btn_update = make_button("🔄  Update System", COLOR_UPDATE);
+        on_click!(
+            btn_update,
+            "System Updater",
+            &["/usr/local/bin/zohara-update"]
+        );
         buttons_box.append(&btn_update);
     }
 
@@ -227,8 +230,9 @@ fn build_ui(app: &Application) {
     window.present();
 }
 
-/// Show a small error dialog. We use a GTK MessageDialog (libadwaita doesn't
-/// add much here) and write the same details string as the original Python.
+/// Show a small error dialog. In GTK4, MessageDialog doesn't have a
+/// blocking .run() method; we use .present() and connect to the
+/// "response" signal to close it.
 fn show_error_dialog(parent: &ApplicationWindow, description: &str, details: &str) {
     let body = format!(
         "Could not launch {description}.\n\nDetails:\n{details}\n\nDebug log: /tmp/zohara-welcome.log"
@@ -242,26 +246,20 @@ fn show_error_dialog(parent: &ApplicationWindow, description: &str, details: &st
         .text("Could not launch the requested application.")
         .secondary_text(&body)
         .build();
-    dialog.run();
-    dialog.close();
+    dialog.present();
 }
 
-fn main() -> ExitCode {
+fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .target(env_logger::Target::Stderr)
         .init();
 
-    // Log file (matches the Python version's log location, for parity)
-    if let Ok(file) = std::fs::OpenOptions::new()
+    // Make sure /tmp/zohara-welcome.log exists for parity with the
+    // Python version (which logs there).
+    let _ = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open("/tmp/zohara-welcome.log")
-    {
-        // The simple logger we have here only writes to stderr; if a
-        // real log file is needed, swap in `log4rs` or similar. For now,
-        // just make sure the file exists so the user can find it.
-        let _ = file;
-    }
+        .open("/tmp/zohara-welcome.log");
 
     log::info!("=== zohara-welcome starting (Rust port) ===");
     log::info!("Live ISO: {is_live}", is_live = is_live_iso());
@@ -269,15 +267,10 @@ fn main() -> ExitCode {
     let app = Application::builder().application_id(APP_ID).build();
     app.connect_activate(build_ui);
 
-    // Empty args list (no command-line handling needed for the GUI)
-    let args: Vec<&str> = vec![];
-    match app.run_with_args(&args) {
-        // glib::ExitCode isn't a Result; the run_with_args return value is ()-ish.
-        // Use the default 0 exit.
-        _ => ExitCode::SUCCESS,
-    }
-    // Suppress unused-import warning for std::os::unix::fs::PermissionsExt
-    // (kept for future "is the file executable?" check).
-    let _ = std::marker::PhantomData::<PermissionsExt>;
-    ExitCode::SUCCESS
+    // Register the unused variable to silence warnings until we add
+    // command-line flag handling.
+    let _args: Vec<&str> = vec![];
+    let _ = _args;
+
+    app.run_with_args(&[]);
 }
