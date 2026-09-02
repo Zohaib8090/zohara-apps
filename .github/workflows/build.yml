@@ -32,6 +32,11 @@ jobs:
           echo 'builder ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/builder
           mkdir -p /home/builder/.cargo /home/builder/target
           chown -R builder:builder /home/builder
+          # The actions/checkout step runs as root and creates files
+          # owned by root. Cargo needs to be able to write Cargo.lock
+          # and a target/ subdir, so chown the workspace BEFORE any
+          # cargo step runs.
+          chown -R builder:builder "$GITHUB_WORKSPACE"
 
       - name: Checkout source
         uses: actions/checkout@v4
