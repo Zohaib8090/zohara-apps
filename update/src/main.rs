@@ -4,15 +4,17 @@
 // System / Kernel / Driver) stacked in a scrollable view, each with
 // a Check / Install / Cancel button row and a live log of pacman output.
 //
-// Async pattern: Check runs in a worker thread (3-5s typical) and
-// installs run in a worker thread (10+ min) -- both post UI updates
-// back to the main thread via glib::idle_add_once.
+// Threading model:
+//   - UI state lives on the main thread (GTK widgets).
+//   - Pacman invocations run on `std::thread::spawn` workers (3-5s
+//     for `pacman -Qu`, 10+ min for `pacman -Syu`).
+//   - Workers send results to the main thread via glib::idle_add_once.
+//   - Shared state (the running pid) is wrapped in Arc<Mutex<>> so
+//     it can move into the worker.
 
-use std::cell::RefCell;
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
-use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -39,8 +41,6 @@ const YELLOW: &str = "#f9e2af";
 const PURPLE: &str = "#cba6f7";
 const TEAL: &str = "#94e2d5";
 
-// One panel configuration. The same struct that the Python `UpdatePanel`
-// class takes in its constructor.
 struct PanelConfig {
     title: &'static str,
     icon: &'static str,
@@ -50,11 +50,12 @@ struct PanelConfig {
     filter: &'static [&'static str],
 }
 
-// Shared state per panel. All GTK widgets and the in-flight install
-// child pid are owned via Rc<RefCell<>> so the closures can reach them.
+// Per-panel state. Widgets stay on the main thread; the only piece of
+// state that moves into a worker thread is the running-pid, which
+// is wrapped in Arc<Mutex<>>.
 struct Panel {
     cfg: &'static PanelConfig,
-    badge_text: Rc<RefCell<String>>,
+    badge_text: Arc<Mutex<String>>,
     badge_color: String,
     badge_label: Label,
     check_btn: Button,
@@ -63,19 +64,12 @@ struct Panel {
     progress: ProgressBar,
     updates_view: TextView,
     log_view: TextView,
-    running_pid: Rc<RefCell<Option<u32>>>,
+    running_pid: Arc<Mutex<Option<u32>>>,
 }
 
 impl Panel {
-    fn set_busy(&self, busy: bool) {
-        self.check_btn.set_sensitive(!busy);
-        self.install_btn.set_sensitive(false); // re-enabled after check
-        self.cancel_btn.set_sensitive(busy);
-        self.progress.set_visible(busy);
-    }
-
     fn render_badge(&self) {
-        let text = self.badge_text.borrow().clone();
+        let text = self.badge_text.lock().unwrap().clone();
         let color = &self.badge_color;
         let html = format!(
             "<span foreground=\"{c}\" background-color=\"{c}22\">{t}</span>",
@@ -86,8 +80,15 @@ impl Panel {
     }
 
     fn set_badge(&self, text: &str) {
-        *self.badge_text.borrow_mut() = text.to_string();
+        *self.badge_text.lock().unwrap() = text.to_string();
         self.render_badge();
+    }
+
+    fn set_busy(&self, busy: bool) {
+        self.check_btn.set_sensitive(!busy);
+        self.install_btn.set_sensitive(false);
+        self.cancel_btn.set_sensitive(busy);
+        self.progress.set_visible(busy);
     }
 }
 
@@ -169,9 +170,7 @@ fn style_button(btn: &Button, color: &str) {
     }
 }
 
-// pacman -Qu -- filter by substring list. Returns (name, current, new).
 fn check_updates(filter: &[&str]) -> Vec<(String, String, String)> {
-    // Refresh DB; ignore network failures.
     let _ = Command::new("pacman")
         .args(["-Sy", "--noconfirm"])
         .stdout(Stdio::null())
@@ -202,9 +201,7 @@ fn check_updates(filter: &[&str]) -> Vec<(String, String, String)> {
         .collect()
 }
 
-// Build one panel as a Box widget, wire the buttons, and return the
-// Box + the Panel struct for the caller to lay out in a ScrolledWindow.
-fn build_panel(cfg: &'static PanelConfig) -> (Box, Rc<Panel>) {
+fn build_panel(cfg: &'static PanelConfig) -> (Box, Arc<Panel>) {
     let card = Box::new(Orientation::Vertical, 10);
     card.set_margin_top(16);
     card.set_margin_bottom(16);
@@ -212,7 +209,6 @@ fn build_panel(cfg: &'static PanelConfig) -> (Box, Rc<Panel>) {
     card.set_margin_end(20);
     card.set_css_classes(&["card"]);
 
-    // Header
     let header = Box::new(Orientation::Horizontal, 8);
 
     let ico = Label::new(Some(cfg.icon));
@@ -238,7 +234,6 @@ fn build_panel(cfg: &'static PanelConfig) -> (Box, Rc<Panel>) {
     header.append(&badge);
     card.append(&header);
 
-    // Description
     let desc = Label::new(Some(cfg.description));
     desc.set_xalign(0.0);
     desc.set_wrap(true);
@@ -248,13 +243,11 @@ fn build_panel(cfg: &'static PanelConfig) -> (Box, Rc<Panel>) {
     ));
     card.append(&desc);
 
-    // Progress bar
     let progress = ProgressBar::new();
     progress.set_show_text(false);
     progress.set_visible(false);
     card.append(&progress);
 
-    // Updates list
     let updates_view = TextView::new();
     updates_view.set_editable(false);
     updates_view.set_monospace(true);
@@ -262,7 +255,6 @@ fn build_panel(cfg: &'static PanelConfig) -> (Box, Rc<Panel>) {
     updates_view.set_visible(false);
     card.append(&updates_view);
 
-    // Log
     let log_view = TextView::new();
     log_view.set_editable(false);
     log_view.set_monospace(true);
@@ -270,7 +262,6 @@ fn build_panel(cfg: &'static PanelConfig) -> (Box, Rc<Panel>) {
     log_view.set_visible(false);
     card.append(&log_view);
 
-    // Buttons
     let btn_row = Box::new(Orientation::Horizontal, 8);
     let check_btn = Button::with_label("Check");
     style_button(&check_btn, BLUE);
@@ -288,9 +279,9 @@ fn build_panel(cfg: &'static PanelConfig) -> (Box, Rc<Panel>) {
     btn_row.append(&spacer2);
     card.append(&btn_row);
 
-    let panel = Rc::new(Panel {
+    let panel = Arc::new(Panel {
         cfg,
-        badge_text: Rc::new(RefCell::new(String::from("Checking…"))),
+        badge_text: Arc::new(Mutex::new(String::from("Checking…"))),
         badge_color: cfg.color.to_string(),
         badge_label: badge,
         check_btn: check_btn.clone(),
@@ -299,25 +290,31 @@ fn build_panel(cfg: &'static PanelConfig) -> (Box, Rc<Panel>) {
         progress: progress.clone(),
         updates_view: updates_view.clone(),
         log_view: log_view.clone(),
-        running_pid: Rc::new(RefCell::new(None)),
+        running_pid: Arc::new(Mutex::new(None)),
     });
     panel.render_badge();
 
-    // ---- Check button handler ----
+    // The Check and Install handlers need to clone Arc<Panel> into a
+    // worker thread. We give each handler a clone of the panel +
+    // a clone of the GTK widget it needs to update. (GTK widgets are
+    // not Send, so they cannot be moved into the worker; we use
+    // glib::idle_add_once from the worker to push work back to the
+    // main thread, where the widget handle lives.)
     let panel_for_check = panel.clone();
-    check_btn.connect_clicked(move |btn| {
-        let p = &panel_for_check;
+    let updates_view_for_check = updates_view.clone();
+    let check_btn_for_check = check_btn.clone();
+    let install_btn_for_check = install_btn.clone();
+    let filter = cfg.filter.to_vec();
+    check_btn.connect_clicked(move |_btn| {
+        let p = panel_for_check.clone();
+        let updates_view = updates_view_for_check.clone();
+        let check_btn = check_btn_for_check.clone();
+        let install_btn = install_btn_for_check.clone();
         p.set_badge("Checking…");
         p.set_busy(true);
-        p.updates_view.set_visible(false);
-        p.log_view.set_visible(false);
-        p.install_btn.set_sensitive(false);
-
-        // Run the check in a worker thread. GTK main loop stays responsive.
-        let p_thread = p.clone();
-        let check_btn = btn.clone();
+        updates_view.set_visible(false);
         thread::spawn(move || {
-            let updates = check_updates(p_thread.cfg.filter);
+            let updates = check_updates(&filter);
             let count = updates.len();
             glib::idle_add_once(move || {
                 let lines: String = updates
@@ -327,48 +324,51 @@ fn build_panel(cfg: &'static PanelConfig) -> (Box, Rc<Panel>) {
                     .join("\n");
                 if count > 0 {
                     let label = if count > 1 { "s" } else { "" };
-                    p_thread.set_badge(&format!("{count} update{label} available"));
-                    p_thread.updates_view.buffer().set_text(&lines);
-                    p_thread.updates_view.set_visible(true);
-                    p_thread.install_btn.set_sensitive(true);
+                    p.set_badge(&format!("{count} update{label} available"));
+                    p.updates_view.buffer().set_text(&lines);
+                    updates_view.set_visible(true);
+                    install_btn.set_sensitive(true);
                 } else {
-                    p_thread.set_badge("Up to date");
-                    p_thread.install_btn.set_sensitive(false);
+                    p.set_badge("Up to date");
+                    install_btn.set_sensitive(false);
                 }
-                p_thread.set_busy(false);
+                p.set_busy(false);
                 check_btn.set_sensitive(true);
             });
         });
     });
 
-    // ---- Install button handler ----
+    // Install handler. We need:
+    //   - the install cmd (Copy on Send via Vec<&'static str>)
+    //   - the running_pid Arc<Mutex<>> (Send, lives in the worker)
+    // The GTK widgets are NOT moved into the worker; we ship only the
+    // Arc<Panel> which holds the widget handles, and we touch them from
+    // glib::idle_add_once callbacks.
+    let cmd_owned: Vec<&'static str> = cfg.install_cmd.to_vec();
     let panel_for_install = panel.clone();
-    install_btn.connect_clicked(move |btn| {
-        let p = &panel_for_install;
+    let install_btn_for_install = install_btn.clone();
+    let cancel_btn_for_install = cancel_btn.clone();
+    install_btn.connect_clicked(move |_btn| {
+        let p = panel_for_install.clone();
+        let cmd = cmd_owned.clone();
         p.set_badge("Installing…");
         p.set_busy(true);
         p.log_view.set_visible(true);
         p.log_view.buffer().set_text("");
 
-        // Spawn the install command. Capture stdout+stderr and stream
-        // each line back to the main thread for display in the log view.
-        let cmd = p.cfg.install_cmd;
-        let log_buf = p.log_view.buffer();
-        let progress = p.progress.clone();
-        let install_btn = btn.clone();
+        let p_thread = p.clone();
+        let install_btn = install_btn_for_install.clone();
+        let cancel_btn = cancel_btn_for_install.clone();
         let check_btn = p.check_btn.clone();
-        let cancel_btn = p.cancel_btn.clone();
-        let badge = Rc::clone(&p.badge_text);
+        let progress = p.progress.clone();
+        let log_view = p.log_view.clone();
+        let running_pid = p.running_pid.clone();
+        let badge_text = p.badge_text.clone();
         let badge_color = p.badge_color.clone();
         let badge_label = p.badge_label.clone();
-        let running_pid = Rc::clone(&p.running_pid);
-        let log_view = p.log_view.clone();
 
-        let handle = thread::spawn(move || {
-            // Brief delay so the UI shows the "Installing..." badge before
-            // we start potentially-noisy output.
+        thread::spawn(move || {
             thread::sleep(Duration::from_millis(50));
-
             let mut cmd_proc = match Command::new(cmd[0])
                 .args(&cmd[1..])
                 .stdout(Stdio::piped())
@@ -377,11 +377,12 @@ fn build_panel(cfg: &'static PanelConfig) -> (Box, Rc<Panel>) {
             {
                 Ok(c) => c,
                 Err(e) => {
+                    let msg = format!("\n[ERROR] failed to spawn: {e}\n");
                     glib::idle_add_once(move || {
-                        let mut end = log_buf.end_iter();
-                        log_buf.insert(&mut end, &format!("\n[ERROR] failed to spawn: {e}\n"));
-                        badge.borrow_mut().clear();
-                        *badge.borrow_mut() = format!("Failed ({e})");
+                        let buf = log_view.buffer();
+                        let mut end = buf.end_iter();
+                        buf.insert(&mut end, &msg);
+                        *badge_text.lock().unwrap() = format!("Failed");
                         let html = format!(
                             "<span foreground=\"{c}\" background-color=\"{c}22\">Failed</span>",
                             c = badge_color
@@ -396,35 +397,34 @@ fn build_panel(cfg: &'static PanelConfig) -> (Box, Rc<Panel>) {
                 }
             };
 
-            // Track pid so Cancel can kill it.
-            let pid = cmd_proc.id();
-            *running_pid.borrow_mut() = Some(pid);
+            *running_pid.lock().unwrap() = Some(cmd_proc.id());
 
-            // Stream stdout
             let stdout = cmd_proc.stdout.take();
             let stderr = cmd_proc.stderr.take();
-            let log_buf_out = log_view.buffer();
-            let log_buf_err = log_view.buffer();
-            let stdout_thread = thread::spawn(move || {
+            let log_for_out = log_view.clone();
+            let out_thread = thread::spawn(move || {
                 if let Some(out) = stdout {
                     let reader = BufReader::new(out);
                     for line in reader.lines().map_while(Result::ok) {
-                        let buf = log_buf_out.clone();
+                        let log = log_for_out.clone();
                         let line_clone = line.clone();
                         glib::idle_add_once(move || {
+                            let buf = log.buffer();
                             let mut end = buf.end_iter();
                             buf.insert(&mut end, &format!("{line_clone}\n"));
                         });
                     }
                 }
             });
-            let stderr_thread = thread::spawn(move || {
+            let log_for_err = log_view.clone();
+            let err_thread = thread::spawn(move || {
                 if let Some(err) = stderr {
                     let reader = BufReader::new(err);
                     for line in reader.lines().map_while(Result::ok) {
-                        let buf = log_buf_err.clone();
+                        let log = log_for_err.clone();
                         let line_clone = line.clone();
                         glib::idle_add_once(move || {
+                            let buf = log.buffer();
                             let mut end = buf.end_iter();
                             buf.insert(&mut end, &format!("{line_clone}\n"));
                         });
@@ -432,42 +432,43 @@ fn build_panel(cfg: &'static PanelConfig) -> (Box, Rc<Panel>) {
                 }
             });
 
-            let _ = stdout_thread.join();
-            let _ = stderr_thread.join();
+            let _ = out_thread.join();
+            let _ = err_thread.join();
             let code = cmd_proc.wait().map(|s| s.code().unwrap_or(1)).unwrap_or(1);
-            *running_pid.borrow_mut() = None;
+            *running_pid.lock().unwrap() = None;
 
+            let install_btn2 = install_btn.clone();
+            let cancel_btn2 = cancel_btn.clone();
+            let check_btn2 = check_btn.clone();
+            let progress2 = progress.clone();
+            let badge_text2 = badge_text.clone();
+            let badge_color2 = badge_color.clone();
+            let badge_label2 = badge_label.clone();
             glib::idle_add_once(move || {
                 if code == 0 {
-                    *badge.borrow_mut() = "Done".to_string();
+                    *badge_text2.lock().unwrap() = "Done".to_string();
                 } else {
-                    *badge.borrow_mut() = format!("Failed (code {code})");
+                    *badge_text2.lock().unwrap() = format!("Failed (code {code})");
                 }
                 let html = format!(
                     "<span foreground=\"{c}\" background-color=\"{c}22\">{t}</span>",
-                    c = badge_color,
-                    t = badge.borrow()
+                    c = badge_color2,
+                    t = badge_text2.lock().unwrap()
                 );
-                badge_label.set_markup(&html);
-                progress.set_visible(false);
-                install_btn.set_sensitive(true);
-                check_btn.set_sensitive(true);
-                cancel_btn.set_sensitive(false);
+                badge_label2.set_markup(&html);
+                progress2.set_visible(false);
+                install_btn2.set_sensitive(true);
+                check_btn2.set_sensitive(true);
+                cancel_btn2.set_sensitive(false);
             });
         });
-
-        // Don't keep the JoinHandle; the worker is self-contained.
-        let _ = handle;
     });
 
-    // ---- Cancel button handler ----
     let panel_for_cancel = panel.clone();
-    cancel_btn.connect_clicked(move |_| {
+    cancel_btn.connect_clicked(move |_btn| {
         let p = &panel_for_cancel;
-        if let Some(pid) = *p.running_pid.borrow() {
-            // Best-effort: send SIGTERM to the pacman process group.
-            // We use `kill` on the pid; the process group approach would
-            // require setsid in the install command.
+        let pid = *p.running_pid.lock().unwrap();
+        if let Some(pid) = pid {
             let _ = Command::new("kill")
                 .args(["-TERM", &pid.to_string()])
                 .status();
@@ -493,14 +494,12 @@ fn main() -> ExitCode {
             .default_height(640)
             .build();
 
-        // Root
         let root = Box::new(Orientation::Vertical, 18);
         root.set_margin_top(24);
         root.set_margin_bottom(24);
         root.set_margin_start(28);
         root.set_margin_end(28);
 
-        // Header
         let hdr = Box::new(Orientation::Horizontal, 8);
         let title_col = Box::new(Orientation::Vertical, 2);
         let title = Label::new(None);
@@ -522,18 +521,15 @@ fn main() -> ExitCode {
         hdr.append(&check_all);
         root.append(&hdr);
 
-        // Divider
         let div = gtk::Separator::new(Orientation::Horizontal);
         root.append(&div);
 
-        // Scrollable panel list
         let scrolled = ScrolledWindow::new();
         scrolled.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
         let panel_box = Box::new(Orientation::Vertical, 16);
         scrolled.set_child(Some(&panel_box));
         root.append(&scrolled);
 
-        // The four panels
         let zohara = PanelConfig {
             title: "Zohara OS Updates",
             icon: "🔷",
@@ -573,17 +569,11 @@ fn main() -> ExitCode {
                 "mesa", "nvidia", "amdgpu", "firmware", "vulkan", "libva", "libdrm", "xf86-video",
             ],
         };
-        let panels: &[&PanelConfig] = &[&zohara, &system, &kernel, &driver];
-        let mut panel_handles: Vec<(Box, Rc<Panel>)> = Vec::new();
-        for cfg in panels {
-            let (card, panel) = build_panel(cfg);
+        for cfg in &[&zohara, &system, &kernel, &driver] {
+            let (card, _panel) = build_panel(cfg);
             panel_box.append(&card);
-            panel_handles.push((card, panel));
         }
-        // silence unused
-        let _ = panel_handles;
 
-        // Status footer
         let footer = Box::new(Orientation::Horizontal, 8);
         let status = Label::new(Some("Ready."));
         status.set_markup("<span foreground=\"#a6adc8\" font_size=\"10pt\">Ready.</span>");
@@ -597,17 +587,6 @@ fn main() -> ExitCode {
 
         window.set_child(Some(&root));
         window.present();
-
-        // Check All button -- auto-clicks each Check button
-        let panel_widgets: Vec<Button> = [&zohara, &system, &kernel, &driver]
-            .iter()
-            .filter_map(|cfg| {
-                // We need to walk the panel_box children to find the
-                // Check button. Simplest: store a Vec<Rc<Panel>>.
-                None
-            })
-            .collect();
-        let _ = panel_widgets; // silence unused warning
     });
 
     let _ = app.run_with_args::<&str>(&[]);
