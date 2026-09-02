@@ -610,6 +610,6 @@ fn main() -> ExitCode {
         let _ = panel_widgets; // silence unused warning
     });
 
-    let _ = app.run_with_args(&[]);
+    let _ = app.run_with_args::<&str>(&[]);
     ExitCode::SUCCESS
 }
