@@ -19,3 +19,6 @@ glib = { workspace = true }
 log = { workspace = true }
 env_logger = { workspace = true }
 zohara-common = { workspace = true }
+# Reads the OS-level accent color zohara-settings' Personalization page
+# writes to ~/.config/zohara/theme.json — see docs/UI-REDESIGN.md.
+serde_json = { workspace = true }
