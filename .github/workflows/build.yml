@@ -75,22 +75,47 @@ jobs:
           fi
           echo "version=$VER" >> "$GITHUB_OUTPUT"
 
-      - name: Package each binary with makepkg
+      - name: Package all four binaries with makepkg
         run: |
-          # Each crate has its own PKGBUILD. We can't easily call makepkg
-          # 4 times in a single workflow, so we install each binary and
-          # its .desktop file directly from the prebuilt cargo target.
-          # (The OTA path uses the same flat layout; makepkg is a
-          # nicety we skip here for simplicity.)
+          # PKGBUILD is a single split package (pkgbase=zohara-apps,
+          # pkgname=(zohara-welcome zohara-update zohara-usermgr
+          # zohara-migrate)) so one makepkg call produces all four real
+          # pacman packages from the binaries "Build Release Binaries" just
+          # built. Before this, CI uploaded the raw ELF binaries as release
+          # assets -- never a .pkg.tar.zst -- so `pacman -S zohara-welcome`
+          # had nothing installable to find, and
+          # zohara-packages/publish.yml's `find -name '*.pkg.tar.zst'`
+          # never matched anything either.
+          chown -R builder:builder .
+          rm -rf target
+          ln -s /home/builder/target target
+          chown -h builder:builder target
+          sudo -u builder env _PKGVER="${{ steps.version.outputs.version }}" \
+            makepkg --nodeps --nocheck --noconfirm
           mkdir -p /tmp/built
-          cp -v /home/builder/target/release/zohara-* /tmp/built/ || true
+          cp -v ./*.pkg.tar.zst /tmp/built/
           ls -lh /tmp/built/
+
+      - name: Upload each package as its own build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: zohara-apps-x86_64
+          path: /tmp/built/*.pkg.tar.zst
 
       - name: Get or create channel release in zohara-packages
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # GITHUB_TOKEN is scoped to THIS repo (zohara-apps) only -- it
+          # cannot create a release or upload an asset in zohara-packages.
+          # Every cross-repo step below needs PACKAGES_DISPATCH_TOKEN, the
+          # same PAT zohara-settings' build.yml already uses for this.
+          GH_TOKEN: ${{ secrets.PACKAGES_DISPATCH_TOKEN }}
           CHANNEL: ${{ steps.channel.outputs.channel }}
         run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::warning::PACKAGES_DISPATCH_TOKEN not set; packages stay in this run's build artifact only."
+            echo "skip=1" >> "$GITHUB_ENV"
+            exit 0
+          fi
           pacman -S --noconfirm --needed github-cli
           if [ "$CHANNEL" = "stable" ]; then
             TAG="stable"
@@ -108,43 +133,54 @@ jobs:
           fi
           echo "release_tag=$TAG" >> "$GITHUB_ENV"
 
-      - name: Upload all built binaries to the channel release
+      - name: Upload all built packages to the channel release
+        if: env.skip != '1'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.PACKAGES_DISPATCH_TOKEN }}
           TAG: ${{ env.release_tag }}
         run: |
-          for bin in /tmp/built/*; do
-            echo "Uploading $(basename "$bin")..."
-            gh release upload "$TAG" "$bin" \
+          for pkg in /tmp/built/*.pkg.tar.zst; do
+            echo "Uploading $(basename "$pkg")..."
+            gh release upload "$TAG" "$pkg" \
               --repo "$PACKAGES_REPO" \
               --clobber
           done
 
       - name: Dispatch to zohara-packages publish workflow
+        if: env.skip != '1'
         env:
           GH_TOKEN: ${{ secrets.PACKAGES_DISPATCH_TOKEN }}
           VER: ${{ steps.version.outputs.version }}
           CHANNEL: ${{ steps.channel.outputs.channel }}
         run: |
-          if [ -z "$GH_TOKEN" ]; then
-            echo "::warning::PACKAGES_DISPATCH_TOKEN not set; zohara.db / apps.json not auto-updated."
-            exit 0
-          fi
-          for bin in /tmp/built/*; do
-            name=$(basename "$bin")
-            pkg="${name%-*}"  # strip version suffix
-            ARTIFACT_URL="https://github.com/$PACKAGES_REPO/releases/download/${{ env.release_tag }}/$name"
-            echo "Dispatching $pkg $VER channel=$CHANNEL"
-            curl -X POST \
+          # One dispatch per package, all pointing at this same run's
+          # artifact (zohara-apps-x86_64, which holds all four .pkg.tar.zst
+          # files) -- artifact_name tells publish.yml which file inside it
+          # to pick, since a blind "first .pkg.tar.zst in the artifact"
+          # would grab the same one regardless of which package_name was
+          # actually being dispatched.
+          # Match by known pkgname prefix rather than parsing the filename
+          # apart (an Arch filename is <pkgname>-<pkgver>-<pkgrel>-<arch>...
+          # and pkgver/pkgrel can themselves contain dashes, which makes
+          # splitting on "-" ambiguous in general).
+          for pkgname in zohara-welcome zohara-update zohara-usermgr zohara-migrate; do
+            pkg="/tmp/built/${pkgname}-${VER}-1-x86_64.pkg.tar.zst"
+            [ -f "$pkg" ] || { echo "::warning::expected $pkg, skipping"; continue; }
+            name=$(basename "$pkg")
+            echo "Dispatching $pkgname $VER channel=$CHANNEL"
+            curl -fsSL -X POST \
               -H "Authorization: token $GH_TOKEN" \
               -H "Accept: application/vnd.github+json" \
               "https://api.github.com/repos/$PACKAGES_REPO/dispatches" \
               -d "{
                 \"event_type\": \"package-published\",
                 \"client_payload\": {
-                  \"package_name\": \"$pkg\",
+                  \"package_name\": \"$pkgname\",
                   \"version\": \"$VER\",
-                  \"artifact_url\": \"$ARTIFACT_URL\",
+                  \"run_id\": \"${{ github.run_id }}\",
+                  \"source_repo\": \"Zohaib8090/zohara-apps\",
+                  \"artifact_name\": \"zohara-apps-x86_64\",
+                  \"pkg_filename\": \"$name\",
                   \"channel\": \"$CHANNEL\"
                 }
               }"
