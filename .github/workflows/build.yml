@@ -32,14 +32,19 @@ jobs:
           echo 'builder ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/builder
           mkdir -p /home/builder/.cargo /home/builder/target
           chown -R builder:builder /home/builder
-          # The actions/checkout step runs as root and creates files
-          # owned by root. Cargo needs to be able to write Cargo.lock
-          # and a target/ subdir, so chown the workspace BEFORE any
-          # cargo step runs.
-          chown -R builder:builder "$GITHUB_WORKSPACE"
 
       - name: Checkout source
         uses: actions/checkout@v4
+
+      - name: Fix workspace ownership for the builder user
+        # actions/checkout runs as root and leaves the workspace
+        # root-owned, so this has to run AFTER checkout, not before --
+        # a chown before checkout gets silently undone by it. Cargo
+        # (running as `builder` below) needs write access to write
+        # Cargo.lock and a target/ subdir; without this, any change that
+        # actually needs to update Cargo.lock fails with "Permission
+        # denied" even though the Rust code itself is fine.
+        run: chown -R builder:builder "$GITHUB_WORKSPACE"
 
       - name: Check Code
         run: sudo -u builder env CARGO_TARGET_DIR=/home/builder/target cargo check --release
