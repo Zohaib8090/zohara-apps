@@ -6,17 +6,15 @@
 //
 // Threading model:
 //   - UI state lives on the main thread (GTK widgets).
-//   - Pacman invocations run on `std::thread::spawn` workers (3-5s
-//     for `pacman -Qu`, 10+ min for `pacman -Syu`).
-//   - Workers send results to the main thread via glib::idle_add_once.
-//   - Shared state (the running pid) is wrapped in Arc<Mutex<>> so
-//     it can move into the worker.
+//   - Pacman invocations run as local async tasks (glib::spawn_future_local)
+//     on a global Tokio runtime (3-5s for `pacman -Qu`, 10+ min for
+//     `pacman -Syu`); see the TOKIO_RUNTIME comment below for why this
+//     replaced an earlier std::thread::spawn design that didn't compile.
+//   - Shared state (the running pid, read by the Cancel button) is
+//     Arc<Mutex<Option<u32>>> so it's visible outside the async task.
 
-use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::Duration;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use glib::ExitCode;
 use gtk::glib;
@@ -24,8 +22,81 @@ use gtk::prelude::*;
 use gtk::{Application, ApplicationWindow, Box, Button, Label, Orientation, ProgressBar, ScrolledWindow, TextView};
 use libadwaita as adw;
 use libadwaita::prelude::*;
+use tokio::io::AsyncBufReadExt;
+use tokio::runtime::Runtime;
 
 const APP_ID: &str = "io.zohara.Update";
+
+// Genuinely `static` (not a local inside connect_activate's closure), so
+// `&PANELS[i]` is `&'static PanelConfig` -- build_panel() requires that,
+// since it hands the reference into Panel, which lives inside an Arc
+// captured by long-lived GTK signal-handler closures. Four locals with
+// the same values, taken by reference from inside a non-'static closure,
+// is exactly the E0597 "does not live long enough" this used to hit.
+static PANELS: [PanelConfig; 4] = [
+    PanelConfig {
+        title: "Zohara OS Updates",
+        icon: "🔷",
+        description: "Official Zohara OS updates: system configs, themes, and built-in apps delivered via the Zohara release channel.",
+        color: PURPLE,
+        install_cmd: &["pacman", "-Syu", "--noconfirm", "zohara-system"],
+        filter: &["zohara"],
+    },
+    PanelConfig {
+        title: "System & Application Updates",
+        icon: "🔄",
+        description: "Full rolling-release update from Arch Linux and Chaotic-AUR repositories. Keeps all installed packages current.",
+        color: BLUE,
+        install_cmd: &["pacman", "-Syu", "--noconfirm"],
+        filter: &[],
+    },
+    PanelConfig {
+        title: "Kernel Updates",
+        icon: "⚡",
+        description: "Updates the Linux Zen kernel powering Zohara OS. A reboot is required to apply kernel changes.",
+        color: YELLOW,
+        install_cmd: &["pacman", "-Syu", "--noconfirm", "linux-zen", "linux-zen-headers"],
+        filter: &["linux-zen", "linux-firmware"],
+    },
+    PanelConfig {
+        title: "Driver & Firmware Updates",
+        icon: "🔧",
+        description: "Updates GPU drivers (Mesa, NVIDIA, AMDGPU), firmware packages, and hardware support modules.",
+        color: TEAL,
+        install_cmd: &[
+            "pacman", "-Syu", "--noconfirm",
+            "mesa", "vulkan-radeon", "vulkan-intel",
+            "vulkan-icd-loader", "linux-firmware",
+            "nvidia-open-dkms", "nvidia-utils", "nvidia-settings",
+        ],
+        filter: &[
+            "mesa", "nvidia", "amdgpu", "firmware", "vulkan", "libva", "libdrm", "xf86-video",
+        ],
+    },
+];
+
+// A global multi-threaded Tokio runtime, entered once in main() and never
+// exited. GTK widgets (Button, Label, TextView, ...) wrap a raw *mut
+// c_void and are not Send, so std::thread::spawn can never move them --
+// every earlier version of this file that tried (directly, or indirectly
+// by moving an Arc<Panel> containing them) failed to compile with E0277
+// "*mut c_void cannot be sent between threads safely". Background work
+// below instead runs as a LOCAL future via glib::spawn_future_local
+// (stays pinned to the main thread's GLib context, so it CAN capture
+// widgets), and only the actual blocking work -- check_updates(), the
+// pacman child process -- crosses onto this runtime, which needs to
+// already be running for tokio::process / tokio::task::spawn_blocking to
+// work. Same pattern as zohara-settings' src/main.rs.
+static TOKIO_RUNTIME: OnceLock<Runtime> = OnceLock::new();
+
+fn tokio_runtime() -> &'static Runtime {
+    TOKIO_RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("failed to initialize Tokio runtime")
+    })
+}
 
 // Catppuccin Mocha palette
 const BG: &str = "#1e1e2e";
@@ -304,7 +375,9 @@ fn build_panel(cfg: &'static PanelConfig) -> (Box, Arc<Panel>) {
     let updates_view_for_check = updates_view.clone();
     let check_btn_for_check = check_btn.clone();
     let install_btn_for_check = install_btn.clone();
-    let filter = cfg.filter.to_vec();
+    // cfg.filter is &'static [&'static str] -- Copy, Send, needs no
+    // cloning to cross into the blocking task below.
+    let filter = cfg.filter;
     check_btn.connect_clicked(move |_btn| {
         let p = panel_for_check.clone();
         let updates_view = updates_view_for_check.clone();
@@ -313,63 +386,55 @@ fn build_panel(cfg: &'static PanelConfig) -> (Box, Arc<Panel>) {
         p.set_badge("Checking…");
         p.set_busy(true);
         updates_view.set_visible(false);
-        thread::spawn(move || {
-            let updates = check_updates(&filter);
+
+        // spawn_future_local pins this future to the main thread's GLib
+        // context (glib's equivalent of tokio::task::spawn_local), so it
+        // can freely capture p/updates_view/etc (not Send). Only the
+        // actual pacman call crosses onto the Tokio runtime's blocking
+        // pool via spawn_blocking, and .await resumes back here on the
+        // main thread once it's done -- no idle_add_once / channel needed.
+        glib::spawn_future_local(async move {
+            let updates = tokio_runtime()
+                .spawn_blocking(move || check_updates(filter))
+                .await
+                .unwrap_or_default();
             let count = updates.len();
-            glib::idle_add_once(move || {
-                let lines: String = updates
-                    .iter()
-                    .map(|(n, c, v)| format!("  {n}   {c} -> {v}"))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                if count > 0 {
-                    let label = if count > 1 { "s" } else { "" };
-                    p.set_badge(&format!("{count} update{label} available"));
-                    p.updates_view.buffer().set_text(&lines);
-                    updates_view.set_visible(true);
-                    install_btn.set_sensitive(true);
-                } else {
-                    p.set_badge("Up to date");
-                    install_btn.set_sensitive(false);
-                }
-                p.set_busy(false);
-                check_btn.set_sensitive(true);
-            });
+            let lines: String = updates
+                .iter()
+                .map(|(n, c, v)| format!("  {n}   {c} -> {v}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            if count > 0 {
+                let label = if count > 1 { "s" } else { "" };
+                p.set_badge(&format!("{count} update{label} available"));
+                p.updates_view.buffer().set_text(&lines);
+                updates_view.set_visible(true);
+                install_btn.set_sensitive(true);
+            } else {
+                p.set_badge("Up to date");
+                install_btn.set_sensitive(false);
+            }
+            p.set_busy(false);
+            check_btn.set_sensitive(true);
         });
     });
 
-    // Install handler. We need:
-    //   - the install cmd (Copy on Send via Vec<&'static str>)
-    //   - the running_pid Arc<Mutex<>> (Send, lives in the worker)
-    // The GTK widgets are NOT moved into the worker; we ship only the
-    // Arc<Panel> which holds the widget handles, and we touch them from
-    // glib::idle_add_once callbacks.
-    let cmd_owned: Vec<&'static str> = cfg.install_cmd.to_vec();
+    // Install handler. cfg.install_cmd is &'static [&'static str] (Copy,
+    // Send) -- no cloning needed. Everything below runs as a single local
+    // future: the child process and its stdout/stderr are driven by
+    // Tokio (entered once in main()), and every GTK widget touch happens
+    // right here on the main thread, so none of it needs to be Send.
+    let cmd = cfg.install_cmd;
     let panel_for_install = panel.clone();
-    let install_btn_for_install = install_btn.clone();
-    let cancel_btn_for_install = cancel_btn.clone();
     install_btn.connect_clicked(move |_btn| {
         let p = panel_for_install.clone();
-        let cmd = cmd_owned.clone();
         p.set_badge("Installing…");
         p.set_busy(true);
         p.log_view.set_visible(true);
         p.log_view.buffer().set_text("");
 
-        let p_thread = p.clone();
-        let install_btn = install_btn_for_install.clone();
-        let cancel_btn = cancel_btn_for_install.clone();
-        let check_btn = p.check_btn.clone();
-        let progress = p.progress.clone();
-        let log_view = p.log_view.clone();
-        let running_pid = p.running_pid.clone();
-        let badge_text = p.badge_text.clone();
-        let badge_color = p.badge_color.clone();
-        let badge_label = p.badge_label.clone();
-
-        thread::spawn(move || {
-            thread::sleep(Duration::from_millis(50));
-            let mut cmd_proc = match Command::new(cmd[0])
+        glib::spawn_future_local(async move {
+            let mut child = match tokio::process::Command::new(cmd[0])
                 .args(&cmd[1..])
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
@@ -377,90 +442,60 @@ fn build_panel(cfg: &'static PanelConfig) -> (Box, Arc<Panel>) {
             {
                 Ok(c) => c,
                 Err(e) => {
-                    let msg = format!("\n[ERROR] failed to spawn: {e}\n");
-                    glib::idle_add_once(move || {
-                        let buf = log_view.buffer();
-                        let mut end = buf.end_iter();
-                        buf.insert(&mut end, &msg);
-                        *badge_text.lock().unwrap() = format!("Failed");
-                        let html = format!(
-                            "<span foreground=\"{c}\" background-color=\"{c}22\">Failed</span>",
-                            c = badge_color
-                        );
-                        badge_label.set_markup(&html);
-                        progress.set_visible(false);
-                        install_btn.set_sensitive(true);
-                        check_btn.set_sensitive(true);
-                        cancel_btn.set_sensitive(false);
-                    });
+                    let buf = p.log_view.buffer();
+                    let mut end = buf.end_iter();
+                    buf.insert(&mut end, &format!("\n[ERROR] failed to spawn: {e}\n"));
+                    p.set_badge("Failed");
+                    p.progress.set_visible(false);
+                    p.install_btn.set_sensitive(true);
+                    p.check_btn.set_sensitive(true);
+                    p.cancel_btn.set_sensitive(false);
                     return;
                 }
             };
 
-            *running_pid.lock().unwrap() = Some(cmd_proc.id());
+            *p.running_pid.lock().unwrap() = child.id();
 
-            let stdout = cmd_proc.stdout.take();
-            let stderr = cmd_proc.stderr.take();
-            let log_for_out = log_view.clone();
-            let out_thread = thread::spawn(move || {
+            let stdout = child.stdout.take();
+            let stderr = child.stderr.take();
+            let p_out = p.clone();
+            let out_fut = async move {
                 if let Some(out) = stdout {
-                    let reader = BufReader::new(out);
-                    for line in reader.lines().map_while(Result::ok) {
-                        let log = log_for_out.clone();
-                        let line_clone = line.clone();
-                        glib::idle_add_once(move || {
-                            let buf = log.buffer();
-                            let mut end = buf.end_iter();
-                            buf.insert(&mut end, &format!("{line_clone}\n"));
-                        });
+                    let mut lines = tokio::io::BufReader::new(out).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        let buf = p_out.log_view.buffer();
+                        let mut end = buf.end_iter();
+                        buf.insert(&mut end, &format!("{line}\n"));
                     }
                 }
-            });
-            let log_for_err = log_view.clone();
-            let err_thread = thread::spawn(move || {
+            };
+            let p_err = p.clone();
+            let err_fut = async move {
                 if let Some(err) = stderr {
-                    let reader = BufReader::new(err);
-                    for line in reader.lines().map_while(Result::ok) {
-                        let log = log_for_err.clone();
-                        let line_clone = line.clone();
-                        glib::idle_add_once(move || {
-                            let buf = log.buffer();
-                            let mut end = buf.end_iter();
-                            buf.insert(&mut end, &format!("{line_clone}\n"));
-                        });
+                    let mut lines = tokio::io::BufReader::new(err).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        let buf = p_err.log_view.buffer();
+                        let mut end = buf.end_iter();
+                        buf.insert(&mut end, &format!("{line}\n"));
                     }
                 }
-            });
+            };
+            // Drains both streams concurrently (so interleaved pacman
+            // output shows up live) and waits for exit, all as one
+            // cooperatively-scheduled local future -- no OS threads.
+            let (_, _, status) = tokio::join!(out_fut, err_fut, child.wait());
+            let code = status.ok().and_then(|s| s.code()).unwrap_or(1);
+            *p.running_pid.lock().unwrap() = None;
 
-            let _ = out_thread.join();
-            let _ = err_thread.join();
-            let code = cmd_proc.wait().map(|s| s.code().unwrap_or(1)).unwrap_or(1);
-            *running_pid.lock().unwrap() = None;
-
-            let install_btn2 = install_btn.clone();
-            let cancel_btn2 = cancel_btn.clone();
-            let check_btn2 = check_btn.clone();
-            let progress2 = progress.clone();
-            let badge_text2 = badge_text.clone();
-            let badge_color2 = badge_color.clone();
-            let badge_label2 = badge_label.clone();
-            glib::idle_add_once(move || {
-                if code == 0 {
-                    *badge_text2.lock().unwrap() = "Done".to_string();
-                } else {
-                    *badge_text2.lock().unwrap() = format!("Failed (code {code})");
-                }
-                let html = format!(
-                    "<span foreground=\"{c}\" background-color=\"{c}22\">{t}</span>",
-                    c = badge_color2,
-                    t = badge_text2.lock().unwrap()
-                );
-                badge_label2.set_markup(&html);
-                progress2.set_visible(false);
-                install_btn2.set_sensitive(true);
-                check_btn2.set_sensitive(true);
-                cancel_btn2.set_sensitive(false);
-            });
+            if code == 0 {
+                p.set_badge("Done");
+            } else {
+                p.set_badge(&format!("Failed (code {code})"));
+            }
+            p.progress.set_visible(false);
+            p.install_btn.set_sensitive(true);
+            p.check_btn.set_sensitive(true);
+            p.cancel_btn.set_sensitive(false);
         });
     });
 
@@ -483,6 +518,13 @@ fn main() -> ExitCode {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .target(env_logger::Target::Stderr)
         .init();
+
+    // Entered once, kept alive for the process lifetime (the guard is
+    // never dropped): every glib::spawn_future_local task below relies on
+    // a Tokio runtime already running so tokio::process / spawn_blocking
+    // work when awaited from the GTK main loop.
+    let rt = tokio_runtime();
+    let _rt_guard = rt.enter();
 
     let app = Application::builder().application_id(APP_ID).build();
     app.connect_activate(|app| {
@@ -530,46 +572,7 @@ fn main() -> ExitCode {
         scrolled.set_child(Some(&panel_box));
         root.append(&scrolled);
 
-        let zohara = PanelConfig {
-            title: "Zohara OS Updates",
-            icon: "🔷",
-            description: "Official Zohara OS updates: system configs, themes, and built-in apps delivered via the Zohara release channel.",
-            color: PURPLE,
-            install_cmd: &["pacman", "-Syu", "--noconfirm", "zohara-system"],
-            filter: &["zohara"],
-        };
-        let system = PanelConfig {
-            title: "System & Application Updates",
-            icon: "🔄",
-            description: "Full rolling-release update from Arch Linux and Chaotic-AUR repositories. Keeps all installed packages current.",
-            color: BLUE,
-            install_cmd: &["pacman", "-Syu", "--noconfirm"],
-            filter: &[],
-        };
-        let kernel = PanelConfig {
-            title: "Kernel Updates",
-            icon: "⚡",
-            description: "Updates the Linux Zen kernel powering Zohara OS. A reboot is required to apply kernel changes.",
-            color: YELLOW,
-            install_cmd: &["pacman", "-Syu", "--noconfirm", "linux-zen", "linux-zen-headers"],
-            filter: &["linux-zen", "linux-firmware"],
-        };
-        let driver = PanelConfig {
-            title: "Driver & Firmware Updates",
-            icon: "🔧",
-            description: "Updates GPU drivers (Mesa, NVIDIA, AMDGPU), firmware packages, and hardware support modules.",
-            color: TEAL,
-            install_cmd: &[
-                "pacman", "-Syu", "--noconfirm",
-                "mesa", "vulkan-radeon", "vulkan-intel",
-                "vulkan-icd-loader", "linux-firmware",
-                "nvidia-open-dkms", "nvidia-utils", "nvidia-settings",
-            ],
-            filter: &[
-                "mesa", "nvidia", "amdgpu", "firmware", "vulkan", "libva", "libdrm", "xf86-video",
-            ],
-        };
-        for cfg in &[&zohara, &system, &kernel, &driver] {
+        for cfg in &PANELS {
             let (card, _panel) = build_panel(cfg);
             panel_box.append(&card);
         }
