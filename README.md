@@ -18,6 +18,14 @@ The end goal: **zero Python in the live ISO**. The Settings app is
 already Rust (`Zohaib8090/zohara-settings`); this workspace replaces
 the four remaining Python/PyQt5 user-facing tools.
 
+`welcome` is the last app in the "flat, no-gradients, no-glass" UI
+redesign underway across the OS — see
+[zohara-settings/docs/UI-REDESIGN.md](https://github.com/Zohaib8090/zohara-settings/blob/main/docs/UI-REDESIGN.md)
+for the design language and current status, including a known bug there:
+`welcome`'s launch buttons treat a successful process spawn as success and
+close the window even when `migrate`/`usermgr` immediately exit(1) as
+stubs.
+
 ## Build
 
 ```sh
